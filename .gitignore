@@ -1,0 +1,69 @@
+# Build directories
+build/
+bin/
+obj/
+out/
+
+# Visual Studio
+.vs/
+*.vcxproj.user
+*.suo
+*.sln.docstates
+*.vcxproj.filters
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# Compiled executables
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.obj
+*.o
+
+# Debug files
+*.pdb
+*.ilk
+*.exp
+
+# Dependencies (auto-downloaded by CMake)
+external/
+_deps/
+
+# Test executables
+test_capture.exe
+test_devices.exe
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Npcap SDK (should be installed separately)
+npcap-sdk/
+
+# ImGui ini
+imgui.ini
