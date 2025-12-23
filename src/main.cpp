@@ -9,8 +9,14 @@
 #include "imgui_impl_opengl3.h"
 #include "packet_capture.h"
 #include "packet_data.h"
+#include "packet_exporter.h"
+#include "tcp_stream.h"
 
 #include <GLFW/glfw3.h>
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>
+#include <windows.h>
+#include <commdlg.h>
 #include <iostream>
 #include <iomanip>
 #include <sstream>
@@ -19,14 +25,20 @@
 #include <ctime>
 
 // ============== Global State ==============
+static GLFWwindow* g_Window = nullptr;
 static PacketBuffer g_PacketBuffer;
 static PacketCapture g_Capture;
-static int g_SelectedDevice = 0;
+static TCPStreamTracker g_StreamTracker;
+static int g_SelectedDevice = -1;  // -1 = auto-select best adapter
 static int g_SelectedPacket = -1;
 static char g_FilterIP[128] = "";
 static char g_FilterProtocol[64] = "";
+static char g_BPFFilter[256] = "";
 static bool g_AutoScroll = true;
 static bool g_DarkTheme = true;
+static bool g_ShowStreamWindow = false;
+static TCPStream g_SelectedStream;
+static bool g_FirstRun = true;
 
 // Capture statistics
 static std::chrono::steady_clock::time_point g_CaptureStartTime;
@@ -43,6 +55,56 @@ static int g_OtherCount = 0;
 static std::string g_StatusMessage = "Ready - Select interface and click Start";
 static bool g_StatusIsError = false;
 
+// ============== File Dialog Helpers ==============
+static std::string openSaveFileDialog(GLFWwindow* window, const char* filter, const char* defaultExt, const char* defaultName = nullptr) {
+    OPENFILENAME ofn;
+    char szFile[260] = {0};
+    
+    if (defaultName) {
+        strcpy_s(szFile, sizeof(szFile), defaultName);
+    }
+    
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = glfwGetWin32Window(window);
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = sizeof(szFile);
+    ofn.lpstrFilter = filter;
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFileTitle = NULL;
+    ofn.nMaxFileTitle = 0;
+    ofn.lpstrInitialDir = NULL;
+    ofn.lpstrDefExt = defaultExt;
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+    
+    if (GetSaveFileName(&ofn) == TRUE) {
+        return std::string(ofn.lpstrFile);
+    }
+    return "";
+}
+
+static std::string openLoadFileDialog(GLFWwindow* window, const char* filter) {
+    OPENFILENAME ofn;
+    char szFile[260] = {0};
+    
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = glfwGetWin32Window(window);
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = sizeof(szFile);
+    ofn.lpstrFilter = filter;
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFileTitle = NULL;
+    ofn.nMaxFileTitle = 0;
+    ofn.lpstrInitialDir = NULL;
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+    
+    if (GetOpenFileName(&ofn) == TRUE) {
+        return std::string(ofn.lpstrFile);
+    }
+    return "";
+}
+
 void onPacketReceived(const PacketInfo& packet) {
     // Debug: Print to console to verify callback is working
     static int debug_count = 0;
@@ -55,6 +117,11 @@ void onPacketReceived(const PacketInfo& packet) {
     g_PacketBuffer.addPacket(packet);
     g_TotalBytes += packet.length;
     
+    // Track TCP streams
+    if (packet.has_tcp) {
+        g_StreamTracker.addPacket(packet);
+    }
+    
     if (packet.protocol == "TCP") g_TCPCount++;
     else if (packet.protocol == "UDP") g_UDPCount++;
     else if (packet.protocol == "ICMP") g_ICMPCount++;
@@ -65,6 +132,7 @@ void onPacketReceived(const PacketInfo& packet) {
 void resetStatistics() {
     g_TotalBytes = 0;
     g_TCPCount = g_UDPCount = g_ICMPCount = g_ARPCount = g_OtherCount = 0;
+    g_StreamTracker.clear();
 }
 
 void setupDarkTheme() {
@@ -98,6 +166,59 @@ void setupDarkTheme() {
     style.GrabMinSize = 16.0f;
     style.WindowBorderSize = 1.0f;
     style.ChildBorderSize = 1.0f;
+}
+
+// ============== Helper: Detect Active Adapters ==============
+int getAdapterPriority(const std::string& desc) {
+    std::string lower = desc;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    
+    // Priority scoring
+    if (lower.find("wi-fi") != std::string::npos || 
+        lower.find("wifi") != std::string::npos || 
+        lower.find("wireless") != std::string::npos) {
+        return 100;  // WiFi highest priority
+    }
+    if (lower.find("ethernet") != std::string::npos || 
+        lower.find("realtek") != std::string::npos ||
+        lower.find("intel") != std::string::npos) {
+        return 90;   // Ethernet second
+    }
+    if (lower.find("loopback") != std::string::npos) {
+        return 10;   // Loopback low priority
+    }
+    if (lower.find("bluetooth") != std::string::npos) {
+        return 20;
+    }
+    if (lower.find("virtual") != std::string::npos || 
+        lower.find("miniport") != std::string::npos) {
+        return 5;    // Virtual adapters lowest
+    }
+    return 50;  // Unknown
+}
+
+std::string getAdapterIcon(const std::string& desc) {
+    std::string lower = desc;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    
+    if (lower.find("wi-fi") != std::string::npos || 
+        lower.find("wifi") != std::string::npos || 
+        lower.find("wireless") != std::string::npos) {
+        return "[WiFi] ";
+    }
+    if (lower.find("ethernet") != std::string::npos) {
+        return "[ETH] ";
+    }
+    if (lower.find("bluetooth") != std::string::npos) {
+        return "[BT] ";
+    }
+    if (lower.find("loopback") != std::string::npos) {
+        return "[LOOP] ";
+    }
+    if (lower.find("virtual") != std::string::npos) {
+        return "[VIRT] ";
+    }
+    return "";
 }
 
 // ============== Title Bar ==============
@@ -139,6 +260,32 @@ void renderControlPanel() {
     
     auto devices = PacketCapture::getDevices();
     
+    // Auto-select best adapter on first run
+    if (g_FirstRun && !devices.empty()) {
+        int best_idx = 0;
+        int best_priority = 0;
+        
+        for (int i = 0; i < (int)devices.size(); i++) {
+            int priority = getAdapterPriority(devices[i].second);
+            if (priority > best_priority) {
+                best_priority = priority;
+                best_idx = i;
+            }
+        }
+        
+        g_SelectedDevice = best_idx;
+        g_FirstRun = false;
+        
+        // Log auto-selection
+        std::cout << "Auto-selected adapter #" << best_idx << ": " 
+                  << devices[best_idx].second << std::endl;
+    }
+    
+    // Ensure valid selection
+    if (g_SelectedDevice < 0 || g_SelectedDevice >= (int)devices.size()) {
+        g_SelectedDevice = devices.empty() ? -1 : 0;
+    }
+    
     // ===== Interface Selection =====
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.85f, 1.0f, 1.0f));
     ImGui::Text("NETWORK INTERFACE");
@@ -146,17 +293,53 @@ void renderControlPanel() {
     ImGui::Separator();
     ImGui::Spacing();
     
+    // Display current selection
+    std::string current_label = "Select interface...";
+    if (g_SelectedDevice >= 0 && g_SelectedDevice < (int)devices.size()) {
+        current_label = getAdapterIcon(devices[g_SelectedDevice].second) + 
+                       devices[g_SelectedDevice].second;
+    }
+    
     ImGui::SetNextItemWidth(-1);
-    if (ImGui::BeginCombo("##Interface", 
-        g_SelectedDevice < (int)devices.size() ? devices[g_SelectedDevice].second.c_str() : "Select interface...")) {
+    if (ImGui::BeginCombo("##Interface", current_label.c_str())) {
         for (int i = 0; i < (int)devices.size(); i++) {
             bool is_selected = (g_SelectedDevice == i);
-            std::string label = std::to_string(i+1) + ". " + devices[i].second;
+            
+            // Build label with icon and priority indicator
+            std::string icon = getAdapterIcon(devices[i].second);
+            int priority = getAdapterPriority(devices[i].second);
+            
+            // Color based on priority
+            ImVec4 color;
+            if (priority >= 90) {
+                color = ImVec4(0.4f, 1.0f, 0.5f, 1.0f);  // Green for WiFi/Ethernet
+            } else if (priority >= 50) {
+                color = ImVec4(1.0f, 1.0f, 0.6f, 1.0f);  // Yellow for others
+            } else {
+                color = ImVec4(0.6f, 0.6f, 0.6f, 1.0f);  // Gray for virtual
+            }
+            
+            ImGui::PushStyleColor(ImGuiCol_Text, color);
+            
+            std::string label = std::to_string(i+1) + ". " + icon + devices[i].second;
+            
             if (ImGui::Selectable(label.c_str(), is_selected)) {
                 g_SelectedDevice = i;
             }
+            
+            ImGui::PopStyleColor();
+            
+            if (is_selected) {
+                ImGui::SetItemDefaultFocus();
+            }
         }
         ImGui::EndCombo();
+    }
+    
+    // Show adapter info
+    if (g_SelectedDevice >= 0 && g_SelectedDevice < (int)devices.size()) {
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Type: %s", 
+            getAdapterIcon(devices[g_SelectedDevice].second).c_str());
     }
     
     ImGui::Spacing();
@@ -255,6 +438,200 @@ void renderControlPanel() {
     ImGui::PopStyleColor(3);
     
     ImGui::Spacing();
+    
+    // ===== Export Section =====
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.85f, 1.0f, 1.0f));
+    ImGui::Text("EXPORT DATA");
+    ImGui::PopStyleColor();
+    ImGui::Separator();
+    ImGui::Spacing();
+    
+    // Export CSV Button - BLUE
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.5f, 0.8f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.6f, 0.9f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.4f, 0.7f, 1.0f, 1.0f));
+    
+    if (ImGui::Button("EXPORT CSV", ImVec2(-1, 45))) {
+        auto packets = g_PacketBuffer.getPackets();
+        if (packets.empty()) {
+            g_StatusMessage = "ERROR: No packets to export";
+            g_StatusIsError = true;
+        } else {
+            // Generate default filename
+            auto now = std::chrono::system_clock::now();
+            auto time = std::chrono::system_clock::to_time_t(now);
+            struct tm timeinfo;
+            localtime_s(&timeinfo, &time);
+            char defaultName[100];
+            sprintf_s(defaultName, sizeof(defaultName), "packets_%04d%02d%02d_%02d%02d%02d.csv",
+                     timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                     timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+            
+            std::string filename = openSaveFileDialog(g_Window, 
+                "CSV Files (*.csv)\0*.csv\0All Files (*.*)\0*.*\0", 
+                "csv", defaultName);
+            
+            if (!filename.empty()) {
+                if (PacketExporter::exportToCSV(packets, filename)) {
+                    g_StatusMessage = "Exported to " + filename;
+                    g_StatusIsError = false;
+                } else {
+                    g_StatusMessage = "ERROR: Failed to export CSV";
+                    g_StatusIsError = true;
+                }
+            }
+        }
+    }
+    ImGui::PopStyleColor(3);
+    
+    ImGui::Spacing();
+    
+    // Export JSON Button - GREEN
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.7f, 0.4f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.8f, 0.5f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.4f, 0.9f, 0.6f, 1.0f));
+    
+    if (ImGui::Button("EXPORT JSON", ImVec2(-1, 45))) {
+        auto packets = g_PacketBuffer.getPackets();
+        if (packets.empty()) {
+            g_StatusMessage = "ERROR: No packets to export";
+            g_StatusIsError = true;
+        } else {
+            // Generate default filename
+            auto now = std::chrono::system_clock::now();
+            auto time = std::chrono::system_clock::to_time_t(now);
+            struct tm timeinfo;
+            localtime_s(&timeinfo, &time);
+            char defaultName[100];
+            sprintf_s(defaultName, sizeof(defaultName), "packets_%04d%02d%02d_%02d%02d%02d.json",
+                     timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                     timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+            
+            std::string filename = openSaveFileDialog(g_Window, 
+                "JSON Files (*.json)\0*.json\0All Files (*.*)\0*.*\0", 
+                "json", defaultName);
+            
+            if (!filename.empty()) {
+                if (PacketExporter::exportToJSON(packets, filename)) {
+                    g_StatusMessage = "Exported to " + filename;
+                    g_StatusIsError = false;
+                } else {
+                    g_StatusMessage = "ERROR: Failed to export JSON";
+                    g_StatusIsError = true;
+                }
+            }
+        }
+    }
+    ImGui::PopStyleColor(3);
+    
+    ImGui::Spacing();
+    ImGui::Spacing();
+    
+    // ===== BPF Filter Section =====
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.85f, 1.0f, 1.0f));
+    ImGui::Text("BPF FILTER");
+    ImGui::PopStyleColor();
+    ImGui::Separator();
+    ImGui::Spacing();
+    
+    ImGui::Text("Filter Expression:");
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputTextWithHint("##BPFFilter", "e.g. tcp port 80", g_BPFFilter, sizeof(g_BPFFilter));
+    
+    if (ImGui::Button("APPLY BPF FILTER", ImVec2(-1, 40))) {
+        if (g_Capture.isRunning()) {
+            if (g_Capture.setBPFFilter(g_BPFFilter)) {
+                g_StatusMessage = "BPF filter applied: " + std::string(g_BPFFilter);
+                g_StatusIsError = false;
+            } else {
+                g_StatusMessage = "ERROR: " + g_Capture.getLastError();
+                g_StatusIsError = true;
+            }
+        } else {
+            g_StatusMessage = "ERROR: Start capture first";
+            g_StatusIsError = true;
+        }
+    }
+    
+    ImGui::Spacing();
+    ImGui::Spacing();
+    
+    // ===== Save/Load PCAP Section =====
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.85f, 1.0f, 1.0f));
+    ImGui::Text("PCAP FILE");
+    ImGui::PopStyleColor();
+    ImGui::Separator();
+    ImGui::Spacing();
+    
+    // Save PCAP Button
+    if (!g_Capture.isSavingPcap()) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.4f, 0.8f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.7f, 0.5f, 0.9f, 1.0f));
+        
+        if (ImGui::Button("START SAVE PCAP", ImVec2(-1, 40))) {
+            if (g_Capture.isRunning()) {
+                auto now = std::chrono::system_clock::now();
+                auto time = std::chrono::system_clock::to_time_t(now);
+                struct tm timeinfo;
+                localtime_s(&timeinfo, &time);
+                char defaultName[100];
+                sprintf_s(defaultName, sizeof(defaultName), "capture_%04d%02d%02d_%02d%02d%02d.pcap",
+                         timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                         timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+                
+                std::string filename = openSaveFileDialog(g_Window,
+                    "PCAP Files (*.pcap)\0*.pcap\0All Files (*.*)\0*.*\0",
+                    "pcap", defaultName);
+                
+                if (!filename.empty()) {
+                    if (g_Capture.startSavingPcap(filename)) {
+                        g_StatusMessage = "Saving to " + filename;
+                        g_StatusIsError = false;
+                    } else {
+                        g_StatusMessage = "ERROR: " + g_Capture.getLastError();
+                        g_StatusIsError = true;
+                    }
+                }
+            } else {
+                g_StatusMessage = "ERROR: Start capture first";
+                g_StatusIsError = true;
+            }
+        }
+        ImGui::PopStyleColor(2);
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.4f, 0.4f, 1.0f));
+        
+        if (ImGui::Button("STOP SAVE PCAP", ImVec2(-1, 40))) {
+            g_Capture.stopSavingPcap();
+            g_StatusMessage = "Stopped saving PCAP";
+            g_StatusIsError = false;
+        }
+        ImGui::PopStyleColor();
+    }
+    
+    ImGui::Spacing();
+    
+    // Load PCAP Button
+    if (ImGui::Button("LOAD PCAP FILE", ImVec2(-1, 40))) {
+        std::string filename = openLoadFileDialog(g_Window,
+            "PCAP Files (*.pcap)\0*.pcap\0All Files (*.*)\0*.*\0");
+        
+        if (!filename.empty()) {
+            g_PacketBuffer.clear();
+            g_StreamTracker.clear();
+            resetStatistics();
+            
+            if (g_Capture.loadPcapFile(filename, onPacketReceived)) {
+                g_StatusMessage = "Loaded " + std::to_string(g_PacketBuffer.size()) + " packets from " + filename;
+                g_StatusIsError = false;
+            } else {
+                g_StatusMessage = "ERROR: " + g_Capture.getLastError();
+                g_StatusIsError = true;
+            }
+        }
+    }
+    
+    ImGui::Spacing();
     ImGui::Spacing();
     
     // ===== Capture Status =====
@@ -336,21 +713,7 @@ void renderControlPanel() {
     ImGui::Spacing();
     ImGui::Spacing();
     
-    // ===== Export =====
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.85f, 1.0f, 1.0f));
-    ImGui::Text("EXPORT DATA");
-    ImGui::PopStyleColor();
-    ImGui::Separator();
-    ImGui::Spacing();
-    
-    if (ImGui::Button("Export CSV", ImVec2(-1, 40))) {
-        g_StatusMessage = "CSV export coming soon...";
-    }
-    if (ImGui::Button("Export JSON", ImVec2(-1, 40))) {
-        g_StatusMessage = "JSON export coming soon...";
-    }
-    
-    ImGui::Spacing();
+    // ===== Options =====
     ImGui::Checkbox("Auto-scroll packet list", &g_AutoScroll);
     
     ImGui::End();
@@ -442,6 +805,19 @@ void renderPacketList() {
                 if (ImGui::Selectable(std::to_string(pkt.id).c_str(), is_selected,
                     ImGuiSelectableFlags_SpanAllColumns)) {
                     g_SelectedPacket = pkt.id;
+                }
+                
+                // Context menu for TCP packets
+                if (ImGui::BeginPopupContextItem()) {
+                    if (pkt.has_tcp && ImGui::MenuItem("Follow TCP Stream")) {
+                        TCPStream* stream = g_StreamTracker.findStream(pkt);
+                        if (stream) {
+                            g_SelectedStream = *stream;
+                            g_SelectedStream.reassemble();
+                            g_ShowStreamWindow = true;
+                        }
+                    }
+                    ImGui::EndPopup();
                 }
                 
                 // Time
@@ -751,6 +1127,205 @@ void renderStatusBar() {
     ImGui::End();
 }
 
+// ============== TCP Stream Window ==============
+void renderTCPStreamWindow() {
+    if (!g_ShowStreamWindow) return;
+    
+    ImGui::SetNextWindowSize(ImVec2(900, 700), ImGuiCond_FirstUseEver);
+    
+    if (!ImGui::Begin("TCP Stream Viewer", &g_ShowStreamWindow, ImGuiWindowFlags_NoCollapse)) {
+        ImGui::End();
+        return;
+    }
+    
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.85f, 1.0f, 1.0f));
+    ImGui::Text("TCP STREAM ANALYSIS");
+    ImGui::PopStyleColor();
+    ImGui::Separator();
+    ImGui::Spacing();
+    
+    // Stream info
+    ImGui::Text("Stream: %s", g_SelectedStream.key.toString().c_str());
+    ImGui::Text("Packets: %d", g_SelectedStream.packet_count);
+    ImGui::Text("Duration: %.3f seconds", g_SelectedStream.end_time - g_SelectedStream.start_time);
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    
+    // Tabs for different views
+    if (ImGui::BeginTabBar("StreamTabs")) {
+        
+        // Client -> Server Tab
+        if (ImGui::BeginTabItem("Client -> Server")) {
+            ImGui::Text("Data size: %zu bytes", g_SelectedStream.client_to_server_data.size());
+            ImGui::Separator();
+            
+            ImGui::BeginChild("ClientData", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
+            
+            // Try to show as text
+            bool is_text = true;
+            for (uint8_t byte : g_SelectedStream.client_to_server_data) {
+                if (byte < 32 && byte != '\n' && byte != '\r' && byte != '\t') {
+                    if (byte > 0) {
+                        is_text = false;
+                        break;
+                    }
+                }
+            }
+            
+            if (is_text && !g_SelectedStream.client_to_server_data.empty()) {
+                std::string text;
+                for (uint8_t byte : g_SelectedStream.client_to_server_data) {
+                    if (byte >= 32 && byte <= 126) {
+                        text += (char)byte;
+                    } else if (byte == '\n') {
+                        text += '\n';
+                    } else if (byte == '\r') {
+                        // skip
+                    } else {
+                        text += '.';
+                    }
+                }
+                ImGui::TextWrapped("%s", text.c_str());
+            } else {
+                // Show hex dump
+                for (size_t i = 0; i < g_SelectedStream.client_to_server_data.size(); i += 16) {
+                    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "%04zx  ", i);
+                    ImGui::SameLine();
+                    
+                    std::string hex, ascii;
+                    for (size_t j = 0; j < 16; j++) {
+                        if (i + j < g_SelectedStream.client_to_server_data.size()) {
+                            uint8_t b = g_SelectedStream.client_to_server_data[i + j];
+                            char h[4];
+                            sprintf(h, "%02x ", b);
+                            hex += h;
+                            ascii += (b >= 32 && b < 127) ? (char)b : '.';
+                        } else {
+                            hex += "   ";
+                        }
+                        if (j == 7) hex += " ";
+                    }
+                    
+                    ImGui::TextColored(ImVec4(0.95f, 0.9f, 0.6f, 1.0f), "%s", hex.c_str());
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(0.6f, 0.95f, 0.6f, 1.0f), " %s", ascii.c_str());
+                }
+            }
+            
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
+        
+        // Server -> Client Tab
+        if (ImGui::BeginTabItem("Server -> Client")) {
+            ImGui::Text("Data size: %zu bytes", g_SelectedStream.server_to_client_data.size());
+            ImGui::Separator();
+            
+            ImGui::BeginChild("ServerData", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
+            
+            // Try to show as text
+            bool is_text = true;
+            for (uint8_t byte : g_SelectedStream.server_to_client_data) {
+                if (byte < 32 && byte != '\n' && byte != '\r' && byte != '\t') {
+                    if (byte > 0) {
+                        is_text = false;
+                        break;
+                    }
+                }
+            }
+            
+            if (is_text && !g_SelectedStream.server_to_client_data.empty()) {
+                std::string text;
+                for (uint8_t byte : g_SelectedStream.server_to_client_data) {
+                    if (byte >= 32 && byte <= 126) {
+                        text += (char)byte;
+                    } else if (byte == '\n') {
+                        text += '\n';
+                    } else if (byte == '\r') {
+                        // skip
+                    } else {
+                        text += '.';
+                    }
+                }
+                ImGui::TextWrapped("%s", text.c_str());
+            } else {
+                // Show hex dump
+                for (size_t i = 0; i < g_SelectedStream.server_to_client_data.size(); i += 16) {
+                    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "%04zx  ", i);
+                    ImGui::SameLine();
+                    
+                    std::string hex, ascii;
+                    for (size_t j = 0; j < 16; j++) {
+                        if (i + j < g_SelectedStream.server_to_client_data.size()) {
+                            uint8_t b = g_SelectedStream.server_to_client_data[i + j];
+                            char h[4];
+                            sprintf(h, "%02x ", b);
+                            hex += h;
+                            ascii += (b >= 32 && b < 127) ? (char)b : '.';
+                        } else {
+                            hex += "   ";
+                        }
+                        if (j == 7) hex += " ";
+                    }
+                    
+                    ImGui::TextColored(ImVec4(0.95f, 0.9f, 0.6f, 1.0f), "%s", hex.c_str());
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(0.6f, 0.95f, 0.6f, 1.0f), " %s", ascii.c_str());
+                }
+            }
+            
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
+        
+        // Export Tab
+        if (ImGui::BeginTabItem("Export")) {
+            ImGui::Spacing();
+            
+            if (ImGui::Button("Save as Text File", ImVec2(250, 40))) {
+                auto now = std::chrono::system_clock::now();
+                auto time = std::chrono::system_clock::to_time_t(now);
+                struct tm timeinfo;
+                localtime_s(&timeinfo, &time);
+                char defaultName[100];
+                sprintf_s(defaultName, sizeof(defaultName), "tcp_stream_%04d%02d%02d_%02d%02d%02d.txt",
+                         timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                         timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+                
+                std::string filename = openSaveFileDialog(g_Window,
+                    "Text Files (*.txt)\0*.txt\0All Files (*.*)\0*.*\0",
+                    "txt", defaultName);
+                
+                if (!filename.empty()) {
+                    std::ofstream file(filename);
+                    if (file.is_open()) {
+                        file << g_SelectedStream.toText();
+                        file.close();
+                        g_StatusMessage = "Stream saved to " + filename;
+                        g_StatusIsError = false;
+                    } else {
+                        g_StatusMessage = "ERROR: Failed to save stream";
+                        g_StatusIsError = true;
+                    }
+                }
+            }
+            
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            
+            ImGui::TextWrapped("This will export the full TCP stream conversation to a text file with hex dump and ASCII representation.");
+            
+            ImGui::EndTabItem();
+        }
+        
+        ImGui::EndTabBar();
+    }
+    
+    ImGui::End();
+}
+
 // ============== Main Entry Point ==============
 int main() {
     if (!glfwInit()) return -1;
@@ -766,6 +1341,8 @@ int main() {
         glfwTerminate();
         return -1;
     }
+    
+    g_Window = window;  // Set global window pointer for file dialogs
     
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
@@ -796,6 +1373,7 @@ int main() {
         renderControlPanel();
         renderPacketList();
         renderPacketDetails();
+        renderTCPStreamWindow();
         renderStatusBar();
         
         ImGui::Render();

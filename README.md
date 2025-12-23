@@ -51,9 +51,24 @@ Modern Wireshark-style interface built with Dear ImGui + OpenGL
 - **Performance Monitoring**: Theo dõi throughput và packet rate
 
 #### 🎯 **Filtering & Search**
+- **BPF Filter Syntax**: Berkeley Packet Filter support (Wireshark-compatible) - **NEW!**
 - **IP Address Filter**: Lọc packets theo địa chỉ IP (source hoặc destination)
 - **Protocol Filter**: Lọc theo loại protocol (TCP, UDP, ICMP, ARP, HTTP, DNS)
 - **Real-time Filtering**: Áp dụng filter ngay lập tức trên packet list
+
+#### 💾 **File Operations** - **NEW!**
+- **Save to .pcap**: Lưu packets vào file .pcap (compatible với Wireshark)
+- **Load from .pcap**: Đọc và phân tích file .pcap đã lưu
+- **Export to CSV**: Export packets sang Excel-compatible CSV format
+- **Export to JSON**: Export với chi tiết đầy đủ protocol layers
+- **Export to TXT**: Human-readable text format với hex dump
+
+#### 🔄 **TCP Stream Analysis** - **NEW!**
+- **Follow TCP Stream**: Xem toàn bộ conversation giữa client-server
+- **Stream Reassembly**: Ghép các TCP segments theo sequence number
+- **Bidirectional View**: Tách biệt data Client→Server và Server→Client
+- **Hex + ASCII View**: Hiển thị stream data ở cả 2 format
+- **Export Stream**: Lưu TCP stream conversation ra file text
 
 ---
 

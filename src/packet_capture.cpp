@@ -365,7 +365,7 @@ static void parseHTTP(PacketInfo& info, const uint8_t* data, int len) {
 // ============== PacketCapture Implementation ==============
 
 PacketCapture::PacketCapture() 
-    : handle_(nullptr), running_(false), packet_counter_(0) {
+    : handle_(nullptr), pcap_dumper_(nullptr), running_(false), packet_counter_(0) {
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2, 2), &wsaData);
 }
@@ -420,6 +420,13 @@ void PacketCapture::stop() {
     
     if (handle_) pcap_breakloop(handle_);
     if (capture_thread_.joinable()) capture_thread_.join();
+    
+    // Stop saving pcap if active
+    if (pcap_dumper_) {
+        pcap_dump_close(pcap_dumper_);
+        pcap_dumper_ = nullptr;
+    }
+    
     if (handle_) {
         pcap_close(handle_);
         handle_ = nullptr;
@@ -672,7 +679,103 @@ void PacketCapture::packetHandler(u_char* user, const struct pcap_pkthdr* header
     size_t copy_len = std::min((size_t)header->len, (size_t)512);
     info.raw_data.assign(packet, packet + copy_len);
     
+    // Save to pcap file if dumper is active
+    if (capture->pcap_dumper_) {
+        pcap_dump((u_char*)capture->pcap_dumper_, header, packet);
+    }
+    
     if (capture->callback_) {
         capture->callback_(info);
     }
 }
+
+// ============== BPF Filter ==============
+
+bool PacketCapture::setBPFFilter(const std::string& filter) {
+    if (!handle_) {
+        last_error_ = "No active capture session";
+        return false;
+    }
+    
+    struct bpf_program fp;
+    if (pcap_compile(handle_, &fp, filter.c_str(), 1, PCAP_NETMASK_UNKNOWN) == -1) {
+        last_error_ = "Failed to compile filter: " + std::string(pcap_geterr(handle_));
+        return false;
+    }
+    
+    if (pcap_setfilter(handle_, &fp) == -1) {
+        last_error_ = "Failed to set filter: " + std::string(pcap_geterr(handle_));
+        pcap_freecode(&fp);
+        return false;
+    }
+    
+    pcap_freecode(&fp);
+    last_error_.clear();
+    return true;
+}
+
+// ============== Save/Load PCAP Files ==============
+
+bool PacketCapture::startSavingPcap(const std::string& filename) {
+    if (!handle_) {
+        last_error_ = "No active capture session";
+        return false;
+    }
+    
+    if (pcap_dumper_) {
+        last_error_ = "Already saving to a file";
+        return false;
+    }
+    
+    pcap_dumper_ = pcap_dump_open(handle_, filename.c_str());
+    if (!pcap_dumper_) {
+        last_error_ = "Failed to open dump file: " + std::string(pcap_geterr(handle_));
+        return false;
+    }
+    
+    last_error_.clear();
+    return true;
+}
+
+void PacketCapture::stopSavingPcap() {
+    if (pcap_dumper_) {
+        pcap_dump_close(pcap_dumper_);
+        pcap_dumper_ = nullptr;
+    }
+}
+
+bool PacketCapture::loadPcapFile(const std::string& filename, PacketCallback callback) {
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_t* handle = pcap_open_offline(filename.c_str(), errbuf);
+    
+    if (!handle) {
+        last_error_ = "Failed to open pcap file: " + std::string(errbuf);
+        return false;
+    }
+    
+    callback_ = callback;
+    packet_counter_ = 0;
+    
+    // Read all packets from file
+    struct pcap_pkthdr* header;
+    const u_char* packet;
+    int result;
+    
+    while ((result = pcap_next_ex(handle, &header, &packet)) >= 0) {
+        if (result == 0) continue; // Timeout
+        
+        // Process packet using the same handler
+        packetHandler((u_char*)this, header, packet);
+    }
+    
+    if (result == -1) {
+        last_error_ = "Error reading pcap file: " + std::string(pcap_geterr(handle));
+        pcap_close(handle);
+        return false;
+    }
+    
+    pcap_close(handle);
+    last_error_.clear();
+    return true;
+}
+
