@@ -541,7 +541,9 @@ void renderControlPanel() {
     if (ImGui::Button("APPLY BPF FILTER", ImVec2(-1, 40))) {
         if (g_Capture.isRunning()) {
             if (g_Capture.setBPFFilter(g_BPFFilter)) {
-                g_StatusMessage = "BPF filter applied: " + std::string(g_BPFFilter);
+                // Clear old packets to show only filtered packets
+                g_PacketBuffer.clear();
+                g_StatusMessage = "BPF filter applied (buffer cleared): " + std::string(g_BPFFilter);
                 g_StatusIsError = false;
             } else {
                 g_StatusMessage = "ERROR: " + g_Capture.getLastError();
